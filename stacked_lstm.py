@@ -7,60 +7,148 @@ import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import MinMaxScaler
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-def split_multivariate_sequences(data, n_steps, n_outputs=1):
+def prepare_multivariate_data(time_series_df, target_country=None, n_steps=5, test_size=0.2, val_size=0.25, random_state=42):
     """
-    Split a multivariate dataset into samples for multiple country prediction
+    Prepare multivariate time series data for LSTM model with improved handling
     
     Args:
-        data: DataFrame with countries as columns and years as index
-        n_steps: Number of time steps to use as input
-        n_outputs: Number of countries to predict (default: 1 for single target)
+        time_series_df: DataFrame with countries as columns and years as index
+        target_country: Country to predict (if None, first country is used)
+        n_steps: Number of time steps for input sequence
+        test_size: Proportion of data to use for testing
+        val_size: Proportion of remaining data to use for validation
+        random_state: Random seed for reproducibility
         
     Returns:
-        X, y: Input sequences and target values
+        Dictionary containing all prepared data and metadata
     """
+    # Handle missing values in the data
+    df_filled = time_series_df.fillna(method='ffill').fillna(method='bfill')
+    
+    # If no target country is specified, use the first column
+    if target_country is None:
+        target_country = df_filled.columns[0]
+    
+    # Ensure target country is in the dataframe
+    if target_country not in df_filled.columns:
+        raise ValueError(f"Target country '{target_country}' not found in dataframe")
+    
+    # Create a new dataframe with target country as first column
+    cols = [target_country] + [col for col in df_filled.columns if col != target_country]
+    df_reordered = df_filled[cols]
+    
+    # Print shapes for debugging
+    print(f"Original dataframe shape: {df_reordered.shape}")
+    print(f"Target country: {target_country}")
+    
+    # Scale the data
+    scaler = MinMaxScaler()
+    scaled_values = scaler.fit_transform(df_reordered)
+    df_scaled = pd.DataFrame(
+        scaled_values,
+        index=df_reordered.index,
+        columns=df_reordered.columns
+    )
+    
+    # Create sequences for multivariate prediction
     X, y = [], []
     
     # For each starting point
-    for i in range(len(data) - n_steps):
-        # Get input sequence
+    for i in range(len(df_scaled) - n_steps):
+        # Get input sequence (all countries, n_steps time points)
         end_ix = i + n_steps
-        # Get all countries data for the input sequence
-        seq_x = data.iloc[i:end_ix].values
+        seq_x = df_scaled.iloc[i:end_ix].values  # Shape: (n_steps, n_countries)
         
-        # Get output value(s)
-        if n_outputs == 1:  # Single target country
-            # Assuming the target country is the first column
-            seq_y = data.iloc[end_ix, 0]  
-        else:  # Multiple target countries
-            # Get multiple countries' values for prediction
-            seq_y = data.iloc[end_ix, :n_outputs].values
+        # Get target value (only target country, single time point)
+        seq_y = df_scaled.iloc[end_ix, 0]  # First column is target country
             
         X.append(seq_x)
         y.append(seq_y)
-        
-    return np.array(X), np.array(y)
+    
+    X = np.array(X)
+    y = np.array(y).reshape(-1, 1)  # Reshape to (samples, 1)
+    
+    # Print shapes for debugging
+    print(f"X shape after sequence creation: {X.shape}")
+    print(f"y shape after sequence creation: {y.shape}")
+    
+    # First split data into train+val and test sets
+    X_temp, X_test, y_temp, y_test = train_test_split(
+        X, y, test_size=test_size, shuffle=False, random_state=random_state
+    )
+    
+    # Then split the temporary set into train and validation sets
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_temp, y_temp, test_size=val_size, shuffle=False, random_state=random_state
+    )
+    
+    # Print final shapes for debugging
+    print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
+    print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
+    print(f"X_test shape: {X_test.shape}, y_test shape: {y_test.shape}")
+    
+    # Save the years for each dataset for later visualization
+    all_years = df_reordered.index.tolist()
+    n_total = len(all_years)
+    n_test = len(y_test)
+    n_val = len(y_val)
+    n_train = len(y_train)
+    
+    test_years = all_years[-n_test:]
+    val_years = all_years[-(n_test + n_val):-n_test]
+    train_years = all_years[:-(n_test + n_val)]
+    
+    return {
+        'X_train': X_train,
+        'X_val': X_val,
+        'X_test': X_test,
+        'y_train': y_train,
+        'y_val': y_val,
+        'y_test': y_test,
+        'scaler': scaler,
+        'target_country': target_country,
+        'input_size': X_train.shape[2],  # Number of features (countries)
+        'train_years': train_years,
+        'val_years': val_years,
+        'test_years': test_years,
+        'all_countries': df_reordered.columns.tolist()
+    }
 
-class StackedLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, output_size, num_layers=2):
-        super(StackedLSTM, self).__init__()
+class ImprovedMultivariateLSTM(nn.Module):
+    def __init__(self, input_size, hidden_size, output_size=1, num_layers=2, dropout=0.2):
+        """
+        Improved LSTM model for multivariate time series forecasting
+        
+        Args:
+            input_size: Number of input features (countries)
+            hidden_size: Number of hidden units
+            output_size: Number of output features (usually 1 for single target country)
+            num_layers: Number of LSTM layers
+            dropout: Dropout probability
+        """
+        super(ImprovedMultivariateLSTM, self).__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.output_size = output_size
         self.num_layers = num_layers
         
-        # First LSTM layer - returns sequences for the second LSTM layer
-        self.lstm1 = nn.LSTM(input_size, hidden_size, batch_first=True)
+        # LSTM layers with proper dropout
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
         
-        # Second LSTM layer - processes the sequences from the first layer
-        self.lstm2 = nn.LSTM(hidden_size, hidden_size, batch_first=True)
-        
-        # Fully connected layers
-        self.dense1 = nn.Linear(hidden_size, hidden_size//2)
+        # Fully connected layers with batch normalization for better training
+        self.bn = nn.BatchNorm1d(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size // 2)
+        self.dropout1 = nn.Dropout(dropout)
         self.relu = nn.ReLU()
-        self.dropout = nn.Dropout(0.2)
-        self.dense2 = nn.Linear(hidden_size//2, output_size)
+        self.fc2 = nn.Linear(hidden_size // 2, output_size)
         
         # Training history
         self.history = {
@@ -73,46 +161,37 @@ class StackedLSTM(nn.Module):
     
     def forward(self, x):
         # x shape: (batch_size, sequence_length, input_size)
+        batch_size = x.size(0)
         
-        # Initialize hidden states for first LSTM layer
-        h0_1 = torch.zeros(1, x.size(0), self.hidden_size).to(x.device)
-        c0_1 = torch.zeros(1, x.size(0), self.hidden_size).to(x.device)
+        # Initialize hidden state and cell state
+        h0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
+        c0 = torch.zeros(self.num_layers, batch_size, self.hidden_size).to(x.device)
         
-        # Forward propagate first LSTM layer
-        # Output shape: (batch_size, sequence_length, hidden_size)
-        lstm1_out, _ = self.lstm1(x, (h0_1, c0_1))
+        # Forward propagate LSTM
+        lstm_out, _ = self.lstm(x, (h0, c0))  # lstm_out: (batch_size, seq_len, hidden_size)
         
-        # Initialize hidden states for second LSTM layer
-        h0_2 = torch.zeros(1, x.size(0), self.hidden_size).to(x.device)
-        c0_2 = torch.zeros(1, x.size(0), self.hidden_size).to(x.device)
+        # Get the output from the last time step
+        last_time_step = lstm_out[:, -1, :]  # (batch_size, hidden_size)
         
-        # Forward propagate second LSTM layer
-        # Output shape: (batch_size, sequence_length, hidden_size)
-        lstm2_out, _ = self.lstm2(lstm1_out, (h0_2, c0_2))
+        # Apply batch normalization
+        normalized = self.bn(last_time_step)
         
-        # Get output of last time step
-        lstm_out = lstm2_out[:, -1, :]
+        # Apply fully connected layers
+        fc1_out = self.fc1(normalized)
+        fc1_out = self.relu(fc1_out)
+        fc1_out = self.dropout1(fc1_out)
+        output = self.fc2(fc1_out)
         
-        # Apply dense layers
-        x = self.dense1(lstm_out)
-        x = self.relu(x)
-        x = self.dropout(x)
-        x = self.dense2(x)
-        
-        return x
+        return output
     
-    def fit(self, X_train, y_train, X_val, y_val, epochs=75, batch_size=32, 
-            learning_rate=1e-4, patience=10, factor=0.5, min_lr=1e-6, device="cpu"):
+    def fit(self, X_train, y_train, X_val, y_val, epochs=100, batch_size=32, 
+            learning_rate=1e-3, patience=15, factor=0.5, min_lr=1e-6, device="cpu"):
         """
-        Complete training method with validation, early stopping, and learning rate scheduling
+        Train the model with early stopping and learning rate scheduling
         """
-        # Debug the shapes
+        # Verify input shapes
         print(f"X_train shape: {X_train.shape}, y_train shape: {y_train.shape}")
         print(f"X_val shape: {X_val.shape}, y_val shape: {y_val.shape}")
-        
-        # Make sure the shapes match on the first dimension
-        assert X_train.shape[0] == y_train.shape[0], f"Training data mismatch: X_train has {X_train.shape[0]} samples but y_train has {y_train.shape[0]}"
-        assert X_val.shape[0] == y_val.shape[0], f"Validation data mismatch: X_val has {X_val.shape[0]} samples but y_val has {y_val.shape[0]}"
         
         # Reset training history
         self.history = {
@@ -130,8 +209,11 @@ class StackedLSTM(nn.Module):
         train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
         val_loader = DataLoader(val_dataset, batch_size=batch_size)
         
-        # Initialize optimizer and loss function
-        optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+        # Move model to device
+        self.to(device)
+        
+        # Initialize optimizer with weight decay (L2 regularization)
+        optimizer = optim.Adam(self.parameters(), lr=learning_rate, weight_decay=1e-5)
         criterion = nn.MSELoss()
         
         # Learning rate scheduler
@@ -144,9 +226,6 @@ class StackedLSTM(nn.Module):
         best_val_loss = float('inf')
         best_model_state = None
         early_stopping_counter = 0
-        
-        # Move model to device
-        self.to(device)
         
         # Training loop
         for epoch in range(epochs):
@@ -162,15 +241,11 @@ class StackedLSTM(nn.Module):
                 
                 # Forward pass
                 outputs = self(inputs)
-                
-                # Ensure targets have correct shape for loss calculation
-                if len(targets.shape) == 1:
-                    targets = targets.unsqueeze(1)
-                
                 loss = criterion(outputs, targets)
                 
                 # Backward pass and optimize
                 loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)  # Gradient clipping
                 optimizer.step()
                 
                 train_loss += loss.item() * inputs.size(0)
@@ -180,21 +255,21 @@ class StackedLSTM(nn.Module):
             # Validation phase
             self.eval()
             val_loss = 0.0
+            val_preds = []
+            val_targets = []
             
             with torch.no_grad():
                 for inputs, targets in val_loader:
                     inputs, targets = inputs.to(device), targets.to(device)
                     outputs = self(inputs)
-                    
-                    # Ensure targets have correct shape for loss calculation
-                    if len(targets.shape) == 1:
-                        targets = targets.unsqueeze(1)
-                    
                     loss = criterion(outputs, targets)
                     val_loss += loss.item() * inputs.size(0)
+                    
+                    val_preds.extend(outputs.cpu().numpy())
+                    val_targets.extend(targets.cpu().numpy())
             
             val_loss /= len(val_loader.dataset)
-            val_rmse = np.sqrt(val_loss)
+            val_rmse = np.sqrt(mean_squared_error(val_targets, val_preds))
             
             # Store metrics in history
             self.history['epochs'].append(epoch + 1)
@@ -228,21 +303,118 @@ class StackedLSTM(nn.Module):
             self.load_state_dict(best_model_state)
             
         # Save the best model
-        torch.save(self.state_dict(), 'best_country_time_series_model.pt')
-        print("Training complete. Best model saved.")
+        torch.save({
+            'model_state_dict': self.state_dict(),
+            'model_config': {
+                'input_size': self.input_size,
+                'hidden_size': self.hidden_size,
+                'output_size': self.output_size,
+                'num_layers': self.num_layers
+            },
+            'history': self.history
+        }, 'best_multivariate_lstm_model.pt')
         
+        print("Training complete. Best model saved.")
         return self
+    
+    def evaluate(self, X_test, y_test, scaler=None, target_idx=0, device="cpu"):
+        """
+        Evaluate the model on test data with option to inverse transform predictions
+        
+        Args:
+            X_test: Test input data
+            y_test: Test target data
+            scaler: The scaler used to normalize the data
+            target_idx: The index of the target variable in the original dataset
+            device: Device to use for computation
+            
+        Returns:
+            Dictionary with evaluation results
+        """
+        self.eval()
+        self.to(device)
+        
+        # Convert data to tensors
+        test_dataset = TensorDataset(torch.FloatTensor(X_test), torch.FloatTensor(y_test))
+        test_loader = DataLoader(test_dataset, batch_size=64)
+        
+        predictions = []
+        actuals = []
+        
+        with torch.no_grad():
+            for inputs, targets in test_loader:
+                inputs, targets = inputs.to(device), targets.to(device)
+                outputs = self(inputs)
+                
+                predictions.extend(outputs.cpu().numpy())
+                actuals.extend(targets.cpu().numpy())
+        
+        predictions = np.array(predictions)
+        actuals = np.array(actuals)
+        
+        # Reshape if needed
+        if len(actuals.shape) == 1:
+            actuals = actuals.reshape(-1, 1)
+        if len(predictions.shape) == 1:
+            predictions = predictions.reshape(-1, 1)
+        
+        # Calculate scaled metrics
+        rmse_scaled = np.sqrt(mean_squared_error(actuals, predictions))
+        mae_scaled = mean_absolute_error(actuals, predictions)
+        
+        # If scaler is provided, inverse transform predictions and actuals
+        if scaler is not None:
+            # Create dummy arrays with zeros for all features
+            pred_dummy = np.zeros((predictions.shape[0], scaler.scale_.shape[0]))
+            actual_dummy = np.zeros((actuals.shape[0], scaler.scale_.shape[0]))
+            
+            # Place predictions and actuals in the target column position
+            pred_dummy[:, target_idx] = predictions.flatten()
+            actual_dummy[:, target_idx] = actuals.flatten()
+            
+            # Inverse transform
+            pred_inversed = scaler.inverse_transform(pred_dummy)[:, target_idx].reshape(-1, 1)
+            actual_inversed = scaler.inverse_transform(actual_dummy)[:, target_idx].reshape(-1, 1)
+            
+            # Calculate unscaled metrics
+            rmse = np.sqrt(mean_squared_error(actual_inversed, pred_inversed))
+            mae = mean_absolute_error(actual_inversed, pred_inversed)
+            
+            # Calculate MAPE, handling zero values
+            epsilon = 1e-10  # Small value to avoid division by zero
+            mape = np.mean(np.abs((actual_inversed - pred_inversed) / (np.abs(actual_inversed) + epsilon))) * 100
+            
+            print(f"Test Results (Original Scale):")
+            print(f"RMSE: {rmse:.6f}")
+            print(f"MAE: {mae:.6f}")
+            print(f"MAPE: {mape:.6f}%")
+            
+            return {
+                'predictions_scaled': predictions,
+                'actuals_scaled': actuals,
+                'predictions': pred_inversed,
+                'actuals': actual_inversed,
+                'rmse_scaled': rmse_scaled,
+                'mae_scaled': mae_scaled,
+                'rmse': rmse,
+                'mae': mae,
+                'mape': mape
+            }
+        else:
+            print(f"Test Results (Scaled):")
+            print(f"RMSE: {rmse_scaled:.6f}")
+            print(f"MAE: {mae_scaled:.6f}")
+            
+            return {
+                'predictions_scaled': predictions,
+                'actuals_scaled': actuals,
+                'rmse_scaled': rmse_scaled,
+                'mae_scaled': mae_scaled
+            }
     
     def plot_training_history(self, figsize=(20, 12), log_scale=True):
         """
         Plot the training history metrics
-        
-        Args:
-            figsize: Figure size as (width, height)
-            log_scale: Whether to use log scale for loss plots
-        
-        Returns:
-            matplotlib.figure.Figure: The figure containing the plots
         """
         if not self.history['epochs']:
             print("No training history available. Please train the model first.")
@@ -342,190 +514,74 @@ class StackedLSTM(nn.Module):
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
         
         # Add a title for the entire figure
-        plt.suptitle('Country Time Series LSTM Model Training Metrics', fontsize=16, fontweight='bold', y=0.98)
+        plt.suptitle('Multivariate LSTM Model Training Metrics', fontsize=16, fontweight='bold', y=0.98)
         
         plt.tight_layout(rect=[0, 0, 1, 0.96])  # Adjust for the suptitle
         
-        # Print summary statistics
-        print(f"Training Summary:")
-        print(f"Total Epochs: {max(self.history['epochs'])}/75")
-        print(f"Best Validation Loss: {best_val_loss:.6f} (Epoch {best_val_loss_epoch})")
-        print(f"Best Validation RMSE: {best_rmse:.6f} (Epoch {best_rmse_epoch})")
-        print(f"Final Training Loss: {self.history['train_loss'][-1]:.6f}")
-        print(f"Final Validation Loss: {self.history['val_loss'][-1]:.6f}")
-        print(f"Final Validation RMSE: {self.history['val_rmse'][-1]:.6f}")
-        
         return fig
     
-    def predict(self, X, batch_size=64, device="cpu"):
+    def plot_predictions(self, predictions, actuals, years=None, title="Model Predictions vs Actual Values", 
+                         country_name=None, figsize=(14, 7)):
         """
-        Make predictions on new data
+        Plot model predictions against actual values
+        
+        Args:
+            predictions: Model predictions
+            actuals: Actual values
+            years: List of years for x-axis (if available)
+            title: Plot title
+            country_name: Name of the country being predicted
+            figsize: Figure size as (width, height)
+            
+        Returns:
+            matplotlib.figure.Figure: The created figure
         """
-        self.eval()
-        self.to(device)
+        # Flatten arrays if needed
+        predictions = predictions.flatten()
+        actuals = actuals.flatten()
         
-        # Convert data to tensor
-        tensor_x = torch.FloatTensor(X)
-        dataset = TensorDataset(tensor_x)
-        loader = DataLoader(dataset, batch_size=batch_size)
+        # Create figure
+        fig, ax = plt.subplots(figsize=figsize)
         
-        predictions = []
+        # Create x-axis values
+        if years is not None:
+            x_values = years
+            x_label = "Year"
+        else:
+            x_values = np.arange(len(predictions))
+            x_label = "Time Step"
         
-        with torch.no_grad():
-            for (inputs,) in loader:
-                inputs = inputs.to(device)
-                outputs = self(inputs)
-                predictions.extend(outputs.cpu().numpy())
+        # Plot actual vs predicted
+        ax.plot(x_values, actuals, 'b-', label='Actual', linewidth=2, marker='o')
+        ax.plot(x_values, predictions, 'r--', label='Predicted', linewidth=2, marker='x')
         
-        return np.array(predictions)
-    
-    def save(self, path):
-        """
-        Save model to file
-        """
-        torch.save({
-            'model_state_dict': self.state_dict(),
-            'model_config': {
-                'input_size': self.input_size,
-                'hidden_size': self.hidden_size,
-                'output_size': self.output_size,
-                'num_layers': self.num_layers
-            },
-            'history': self.history
-        }, path)
-        print(f"Model saved to {path}")
-    
-    @classmethod
-    def load(cls, path, device="cpu"):
-        """
-        Load model from file
-        """
-        checkpoint = torch.load(path, map_location=device)
-        config = checkpoint['model_config']
+        # Shade the area between
+        ax.fill_between(x_values, actuals, predictions, color='lightgray', alpha=0.3)
         
-        model = cls(
-            input_size=config['input_size'],
-            hidden_size=config['hidden_size'],
-            output_size=config['output_size'],
-            num_layers=config['num_layers']
-        )
+        # Add country name to title if provided
+        if country_name:
+            title = f"{title} - {country_name}"
         
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Calculate metrics
+        rmse = np.sqrt(mean_squared_error(actuals, predictions))
+        mae = mean_absolute_error(actuals, predictions)
         
-        # Load history if available
-        if 'history' in checkpoint:
-            model.history = checkpoint['history']
+        # Add metrics to plot
+        metrics_text = f"RMSE: {rmse:.4f}\nMAE: {mae:.4f}"
+        ax.text(0.05, 0.95, metrics_text, transform=ax.transAxes, fontsize=12,
+                verticalalignment='top', bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.7))
         
-        model.to(device)
-        return model
-
-def prepare_country_data(time_series_df, target_country=None, n_steps=5, test_size=0.2, random_state=42):
-    """
-    Prepare country time series data for LSTM model
-    
-    Args:
-        time_series_df: DataFrame with countries as columns and years as index
-        target_country: Country to predict (if None, first country is used)
-        n_steps: Number of time steps for input sequence
-        test_size: Proportion of data to use for testing
-        random_state: Random seed for reproducibility
+        # Formatting
+        ax.set_title(title, fontsize=16, fontweight='bold')
+        ax.set_xlabel(x_label, fontsize=12)
+        ax.set_ylabel('Value', fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc='upper right')
         
-    Returns:
-        X_train, X_val, y_train, y_val, scaler: Prepared data and scaler
-    """
-    # Handle missing values in the data
-    df_filled = time_series_df.fillna(method='ffill').fillna(method='bfill')
-    
-    # If no target country is specified, use the first column
-    if target_country is None:
-        target_country = df_filled.columns[0]
-    
-    # Ensure target country is in the dataframe
-    if target_country not in df_filled.columns:
-        raise ValueError(f"Target country '{target_country}' not found in dataframe")
-    
-    # Create a new dataframe with target country as first column
-    cols = [target_country] + [col for col in df_filled.columns if col != target_country]
-    df_reordered = df_filled[cols]
-    
-    # Scale the data
-    scaler = MinMaxScaler()
-    df_scaled = pd.DataFrame(
-        scaler.fit_transform(df_reordered),
-        index=df_reordered.index,
-        columns=df_reordered.columns
-    )
-    
-    # Split into sequences
-    X, y = split_multivariate_sequences(df_scaled, n_steps=n_steps)
-    
-    # Split into train and validation sets
-    X_train, X_val, y_train, y_val = train_test_split(
-        X, y, test_size=test_size, shuffle=False, random_state=random_state
-    )
-    
-    return X_train, X_val, y_train, y_val, scaler
-
-    
-
-# Example usage:
-"""
-# Assuming time_series_df is your pandas DataFrame with countries as columns
-# and years as indices
-
-# 1. Prepare the data
-X_train, X_val, y_train, y_val, scaler = prepare_country_data(
-    time_series_df,
-    target_country='Germany',  # Country you want to predict
-    n_steps=5,                 # Number of time steps to use as input
-    test_size=0.2              # 20% of data for validation
-)
-
-# 2. Define model parameters
-input_size = X_train.shape[2]   # Number of countries (features)
-hidden_size = 64                # Hidden layer size
-output_size = 1                 # Single target country
-num_layers = 2                  # Number of LSTM layers
-
-# 3. Create and train model
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model = StackedLSTM(input_size, hidden_size, output_size, num_layers)
-
-model.fit(
-    X_train, y_train,
-    X_val, y_val,
-    epochs=100,
-    batch_size=32,
-    learning_rate=0.001,
-    patience=15,
-    device=device
-)
-
-# 4. Plot training progress
-fig = model.plot_training_history()
-plt.show()
-
-# 5. Make predictions on validation data
-val_predictions = model.predict(X_val, device=device)
-
-# 6. Inverse transform predictions to original scale
-val_pred_reshaped = np.zeros((val_predictions.shape[0], X_train.shape[2]))
-val_pred_reshaped[:, 0] = val_predictions.flatten()  # Put predictions in first column
-val_pred_original = scaler.inverse_transform(val_pred_reshaped)[:, 0]  # Get first column
-
-# 7. Inverse transform actual values
-y_val_reshaped = np.zeros((y_val.shape[0], X_train.shape[2]))
-y_val_reshaped[:, 0] = y_val  # Put actual values in first column
-y_val_original = scaler.inverse_transform(y_val_reshaped)[:, 0]  # Get first column
-
-# 8. Plot predictions vs actual
-plt.figure(figsize=(12, 6))
-plt.plot(y_val_original, 'b-', label='Actual')
-plt.plot(val_pred_original, 'r--', label='Predicted')
-plt.title(f'Internet Usage Prediction for Germany')
-plt.xlabel('Time Step')
-plt.ylabel('Internet Usage (%)')
-plt.legend()
-plt.grid(True, alpha=0.3)
-plt.show()
-"""
+        # Format x-axis to show years properly if provided
+        if years is not None:
+            plt.setp(ax.get_xticklabels(), rotation=45)
+        
+        plt.tight_layout()
+        
+        return fig
