@@ -1,0 +1,13 @@
+internet_usage.txt
+
+__pycache__/
+
+*.csv
+
+
+*.pt
+
+*.pth
+
+*.pkl
+
